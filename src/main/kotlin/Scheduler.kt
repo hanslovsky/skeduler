@@ -2,12 +2,8 @@ package me.hanslovsky.skeduler
 
 import jep.DirectNDArray
 import jep.SharedInterpreter
-import net.imglib2.img.array.ArrayImg
-import net.imglib2.type.NativeType
-import net.imglib2.type.numeric.integer.UnsignedByteType
 import net.imglib2.type.numeric.real.FloatType
 import org.ntakt.*
-import org.ntakt.access.FloatBufferAccess
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.util.concurrent.*
@@ -96,38 +92,61 @@ fun main() {
     val timeout = 100L
     val unit = TimeUnit.MILLISECONDS
 
-    val means = mutableListOf<Float>()
-    val interpreter = SharedInterpreter().also { it.exec("import numpy as np") }
+    val outputs = mutableListOf<Any>()
+    val interpreter = SharedInterpreter()
+    interpreter.exec(
+        """
+            import numpy as np
+            from tensorflow import keras
+            from tensorflow.keras import layers
+            from tensorflow.keras.optimizers import SGD
+            model = keras.Sequential(
+                [
+                    keras.Input(shape=(100, 200)),
+                    layers.Dense(1, activation=None, name="layer1", use_bias=True),
+                ]
+            )
+            opt = SGD(learning_rate=0.01, momentum=0.9)
+            model.compile(optimizer=opt, loss='mse')
+        """.trimIndent()
+    )
+    interpreter.exec("import numpy as np")
+    interpreter.exec("import tensorflow as tf")
     val generator = { seed: Long ->
         val rng = Random(seed)
         val t = FloatType()
         val dims = intArrayOf(100, 200)
         val buf = ByteBuffer.allocateDirect(t.bitsPerPixel / 8 * dims.fold(1) { a, b -> a * b })
+        val bufGt = ByteBuffer.allocateDirect(t.bitsPerPixel / 8 * dims.fold(1) { a, b -> a * b})
         // do imglib2 processing
         val img = ntakt.float32s(buf.asFloatBuffer().access, *dims) { rng.nextFloat() }
-        Thread.sleep(3000)
-        img to buf.asFloatBuffer()
+        val gt = ntakt.float32s(buf.asFloatBuffer().access, *dims) { (it % 2).toFloat() }
+        (img to buf.asFloatBuffer()) to (gt to bufGt.asFloatBuffer())
     }
 
 
     RandomStateScheduler(12, generator = generator)
         .use { scheduler ->
             val trainer = Trainer(scheduler) {
-                val ndArray = DirectNDArray(it.second, *it.first.dimsAsInts)
+                val raw = it.first
+                val gt = it.second
+                val ndArray = DirectNDArray(raw.second, *raw.first.dimsAsInts)
+                val ndArrayGt = DirectNDArray(gt.second, *gt.first.dimsAsInts)
                 interpreter.set("array", ndArray)
-                interpreter.exec("mean = np.mean(array)")
-                interpreter.getValue("mean", java.lang.Float::class.java).toFloat()
+                interpreter.set("gt", ndArrayGt)
+                interpreter.exec("mean = model.fit(array, gt)")
+                interpreter.getValue("mean")
             }
-            while (means.size < 20) {
+            while (outputs.size < 10) {
                 try {
-                    means += trainer.trainNext(timeout, unit)
+                    outputs += trainer.trainNext(timeout, unit)
                 } catch (e: NoNextAvailable) {
                     // pass
                 }
             }
         }
 
-    println(means)
+    println(outputs)
 
 
 
